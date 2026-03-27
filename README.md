@@ -23,7 +23,7 @@ Magic routing is a single block in a call flow, used alongside existing FusionPB
 ## Architecture
 
 - **Cloudflare Dynamic Workers** — V8 isolates that start in milliseconds with no containers, no Docker, no lifecycle management. Each customer's code runs in a fully isolated sandbox.
-- **PostgREST** — The Worker fetches customer code from the `magic_routing_blocks` table via PostgREST (fronted by Cloudflare).
+- **PostgREST** — The Worker fetches customer code from the `magic_routing` table via PostgREST (fronted by Cloudflare).
 - **FreeSWITCH Lua** — A Lua script in the FusionPBX dialplan scripts directory handles the HTTP call and executes the routing decision.
 
 ## Customer Code
@@ -81,11 +81,11 @@ FusionPBX primitives (ring groups, IVRs, voicemail, etc.) are reached via `trans
 
 ## Database
 
-The `magic_routing_blocks` table in PostgreSQL:
+The `magic_routing` table in PostgreSQL:
 
 ```sql
-CREATE TABLE magic_routing_blocks (
-    magic_routing_block_uuid  uuid          NOT NULL DEFAULT gen_random_uuid(),
+CREATE TABLE magic_routing (
+    magic_routing_uuid  uuid          NOT NULL DEFAULT gen_random_uuid(),
     domain_uuid               uuid,
     block_name                text,
     block_description         text,
@@ -97,7 +97,7 @@ CREATE TABLE magic_routing_blocks (
     insert_user               uuid,
     update_date               timestamptz,
     update_user               uuid,
-    CONSTRAINT magic_routing_blocks_pkey PRIMARY KEY (magic_routing_block_uuid)
+    CONSTRAINT magic_routing_pkey PRIMARY KEY (magic_routing_uuid)
 );
 ```
 

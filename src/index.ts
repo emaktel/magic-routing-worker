@@ -141,10 +141,10 @@ export default {
  * Fetch the customer's routing code from PostgREST.
  *
  * Expects a table like:
- *   magic_routing_blocks(id uuid PK, code text, domain_uuid uuid, enabled bool)
+ *   magic_routing(magic_routing_uuid uuid PK, code text, domain_uuid uuid, enabled bool)
  */
 async function fetchRoutingCode(env: Env, blockId: string): Promise<string | null> {
-	const url = `${env.POSTGREST_URL}/magic_routing_blocks?magic_routing_block_uuid=eq.${encodeURIComponent(blockId)}&enabled=eq.true&select=code&limit=1`;
+	const url = `${env.POSTGREST_URL}/magic_routing?magic_routing_uuid=eq.${encodeURIComponent(blockId)}&enabled=eq.true&select=code&limit=1`;
 
 	const resp = await fetch(url, {
 		headers: {
