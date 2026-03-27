@@ -1,0 +1,21 @@
+{
+	"name": "magic-routing",
+	"main": "src/index.ts",
+	"compatibility_date": "2026-03-01",
+
+	// Dynamic Worker Loader binding
+	"worker_loaders": [
+		{
+			"binding": "LOADER"
+		}
+	],
+
+	// Environment variables (non-secret)
+	"vars": {
+		"POSTGREST_URL": "https://prod-ro-db.emaktalk.com/api"
+	}
+
+	// Secrets (set via `npx wrangler secret put`):
+	//   MAGIC_ROUTING_API_KEY   - authenticates requests from FreeSWITCH
+	//   POSTGREST_API_KEY       - authenticates requests to PostgREST
+}
