@@ -5,9 +5,9 @@
  * customer's routing code from PostgREST, loads it as a Dynamic Worker,
  * and returns the routing decision.
  *
- * When test_user_uuid is provided in the request, broadcasts the routing
- * result in real-time to the user's WebSocket session via the fusion
- * WebSocket worker service binding.
+ * The worker injects logging utilities into the sandbox so customer code
+ * can call log() and all fetch() calls are automatically tracked. Logs
+ * are returned in the response and broadcast via WebSocket for live testing.
  */
 
 interface Env {
@@ -20,7 +20,7 @@ interface Env {
 			globalOutbound?: Fetcher | null;
 		}): {
 			getEntrypoint(): {
-				route(ctx: CallContext): Promise<RoutingDecision>;
+				route(ctx: CallContext): Promise<RoutingResult>;
 			};
 		};
 	};
@@ -55,19 +55,26 @@ interface CallContext {
 	[key: string]: string | undefined;
 }
 
-interface RoutingDecision {
+interface RoutingResult {
 	app: string;
 	data?: string;
 	continue_routing?: boolean;
 	error?: string;
+	/** Execution logs collected by the sandbox */
+	_logs?: LogEntry[];
+}
+
+interface LogEntry {
+	type: "log" | "fetch" | "decision" | "error";
+	message: string;
+	timestamp: number;
+	data?: unknown;
 }
 
 interface RouteRequest {
 	block_id: string;
 	call_context: CallContext;
-	/** When set, broadcasts the routing result to this user via WebSocket. If not set, broadcasts to domain_uuid from call_context. */
 	test_user_uuid?: string;
-	/** When set, includes the block name in the test broadcast */
 	test_block_name?: string;
 }
 
@@ -80,17 +87,17 @@ interface MagicRoutingBlock {
 
 export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
-		// only accept POST to /route
 		const url = new URL(request.url);
 		if (url.pathname !== "/route" || request.method !== "POST") {
 			return Response.json({ error: "Not found" }, { status: 404 });
 		}
 
-		// authenticate
 		const apiKey = request.headers.get("X-API-Key");
 		if (!apiKey || apiKey !== env.MAGIC_ROUTING_API_KEY) {
 			return Response.json({ error: "Unauthorized" }, { status: 401 });
 		}
+
+		const startTime = Date.now();
 
 		try {
 			const body = (await request.json()) as RouteRequest;
@@ -100,47 +107,41 @@ export default {
 				return Response.json({ error: "Missing block_id" }, { status: 400 });
 			}
 
-			// fetch the customer's code from PostgREST
 			const code = await fetchRoutingCode(env, block_id);
 			if (!code) {
-				// Broadcast error to test user if in test mode
-				if (test_user_uuid) {
+				const logs: LogEntry[] = [{ type: "error", message: "Routing block not found or disabled", timestamp: Date.now() }];
+				if (test_user_uuid || call_context.domain_uuid) {
 					await broadcastTestResult(env, { userUuid: test_user_uuid, domainUuid: call_context.domain_uuid }, {
-						block_id,
-						block_name: test_block_name,
-						success: false,
+						block_id, block_name: test_block_name, success: false,
 						error: "Routing block not found or disabled",
-						call_context,
-						timestamp: Date.now(),
+						logs, call_context, duration_ms: Date.now() - startTime, timestamp: Date.now(),
 					});
 				}
 				return Response.json({ error: "Routing block not found" }, { status: 404 });
 			}
 
-			// wrap customer code in a Dynamic Worker module
+			// Build the instrumented worker module with logging
 			const workerCode = buildWorkerModule(code);
 
-			// load and execute the Dynamic Worker
 			const worker = env.LOADER.load({
 				compatibilityDate: "2026-03-01",
 				mainModule: "magic.js",
 				modules: { "magic.js": workerCode },
-				// allow outbound fetch so customer code can call external APIs
 				globalOutbound: undefined,
 			});
 
 			const result = await worker.getEntrypoint().route(call_context);
 
-			// validate the response
+			// Extract logs from the result
+			const logs: LogEntry[] = result._logs || [];
+
 			if (!result || !result.app) {
-				if (test_user_uuid) {
+				logs.push({ type: "error", message: result?.error || "Invalid routing decision returned", timestamp: Date.now() });
+				if (test_user_uuid || call_context.domain_uuid) {
 					await broadcastTestResult(env, { userUuid: test_user_uuid, domainUuid: call_context.domain_uuid }, {
-						block_id,
-						block_name: test_block_name,
-						success: false,
-						error: result?.error || "Invalid routing decision returned",
-						call_context,
-						timestamp: Date.now(),
+						block_id, block_name: test_block_name, success: false,
+						error: result?.error || "Invalid routing decision",
+						logs, call_context, duration_ms: Date.now() - startTime, timestamp: Date.now(),
 					});
 				}
 				return Response.json({ error: "Invalid routing decision returned" }, { status: 500 });
@@ -148,20 +149,15 @@ export default {
 
 			const allowed = ["transfer", "bridge", "playback", "set", "hangup"];
 			if (!allowed.includes(result.app)) {
-				if (test_user_uuid) {
+				logs.push({ type: "error", message: `Disallowed app: ${result.app}`, timestamp: Date.now() });
+				if (test_user_uuid || call_context.domain_uuid) {
 					await broadcastTestResult(env, { userUuid: test_user_uuid, domainUuid: call_context.domain_uuid }, {
-						block_id,
-						block_name: test_block_name,
-						success: false,
+						block_id, block_name: test_block_name, success: false,
 						error: `Disallowed app: ${result.app}`,
-						call_context,
-						timestamp: Date.now(),
+						logs, call_context, duration_ms: Date.now() - startTime, timestamp: Date.now(),
 					});
 				}
-				return Response.json(
-					{ error: `Disallowed app: ${result.app}` },
-					{ status: 400 }
-				);
+				return Response.json({ error: `Disallowed app: ${result.app}` }, { status: 400 });
 			}
 
 			const decision = {
@@ -170,14 +166,19 @@ export default {
 				continue_routing: result.continue_routing || false,
 			};
 
-			// Broadcast result to test user via WebSocket
-			if (test_user_uuid) {
+			// Add the final decision as a log entry
+			logs.push({ type: "decision", message: `Routing decision: ${decision.app} → ${decision.data}`, timestamp: Date.now(), data: decision });
+
+			// Broadcast result via WebSocket
+			if (test_user_uuid || call_context.domain_uuid) {
 				await broadcastTestResult(env, { userUuid: test_user_uuid, domainUuid: call_context.domain_uuid }, {
 					block_id,
 					block_name: test_block_name,
 					success: true,
 					decision,
+					logs,
 					call_context,
+					duration_ms: Date.now() - startTime,
 					timestamp: Date.now(),
 				});
 			}
@@ -191,11 +192,8 @@ export default {
 	},
 };
 
-/**
- * Broadcast a test result via the WebSocket worker.
- * If userUuid is provided, sends to that specific user.
- * Otherwise, broadcasts to all users in the domain (via domainUuid).
- */
+// ─── WebSocket Broadcast ─────────────────────────────────────────────────────
+
 async function broadcastTestResult(
 	env: Env,
 	targeting: { userUuid?: string; domainUuid?: string },
@@ -206,88 +204,130 @@ async function broadcastTestResult(
 			type: "magic_routing_test_result",
 			data,
 		};
-
 		if (targeting.userUuid) {
 			body.userUuid = targeting.userUuid;
 		} else if (targeting.domainUuid) {
 			body.domainUuid = targeting.domainUuid;
 		} else {
-			return; // No targeting — skip broadcast
+			return;
 		}
-
 		await env.WEBSOCKET_WORKER.fetch("https://internal/broadcast", {
 			method: "POST",
 			headers: { "Content-Type": "application/json" },
 			body: JSON.stringify(body),
 		});
 	} catch (err) {
-		// Non-critical — don't fail the routing decision because of a WS broadcast error
 		console.error("[magic-routing] Failed to broadcast test result:", err);
 	}
 }
 
-/**
- * Fetch the customer's routing code from PostgREST.
- *
- * Expects a table like:
- *   magic_routing(id uuid PK, code text, domain_uuid uuid, enabled bool)
- */
+// ─── PostgREST ───────────────────────────────────────────────────────────────
+
 async function fetchRoutingCode(env: Env, blockId: string): Promise<string | null> {
 	const url = `${env.POSTGREST_URL}/magic_routing?id=eq.${encodeURIComponent(blockId)}&enabled=eq.true&select=code&limit=1`;
-
 	const resp = await fetch(url, {
 		headers: {
 			"Authorization": `Bearer ${env.POSTGREST_API_KEY}`,
 			"Accept": "application/json",
 		},
 	});
-
 	if (!resp.ok) {
 		console.error("[magic-routing] PostgREST error:", resp.status, await resp.text());
 		return null;
 	}
-
 	const rows = (await resp.json()) as MagicRoutingBlock[];
-	if (!rows || rows.length === 0) {
-		return null;
-	}
-
+	if (!rows || rows.length === 0) return null;
 	return rows[0].code;
 }
 
+// ─── Dynamic Worker Module Builder ───────────────────────────────────────────
+
 /**
- * Wraps the customer's code in a Dynamic Worker module.
- *
- * The customer writes a `route(ctx)` function that receives call context
- * and returns { app, data, continue_routing? }.
- *
- * Example customer code:
- *
- *   async function route(ctx) {
- *     const weather = await fetch("https://api.weather.com/...");
- *     const data = await weather.json();
- *     if (data.condition === "sunny") {
- *       return { app: "transfer", data: "100 XML default" };
- *     }
- *     return { app: "transfer", data: "200 XML default" };
- *   }
+ * Wraps the customer's code with:
+ * - A log() function that collects debug messages
+ * - A wrapped fetch() that auto-logs API calls and responses
+ * - Collects all logs and returns them alongside the routing decision
  */
 function buildWorkerModule(customerCode: string): string {
 	return `
-// Customer-defined routing logic
+// ─── Instrumentation Layer ───────────────────────────────────────────────────
+const __logs = [];
+const __startTime = Date.now();
+
+function log(message, data) {
+	__logs.push({
+		type: "log",
+		message: String(message),
+		timestamp: Date.now(),
+		data: data !== undefined ? data : undefined
+	});
+}
+
+// Wrap the global fetch to auto-log API calls
+const __originalFetch = globalThis.fetch;
+globalThis.fetch = async function(input, init) {
+	const url = typeof input === "string" ? input : input.url;
+	const method = init?.method || "GET";
+	const fetchStart = Date.now();
+
+	log("API call: " + method + " " + url);
+
+	try {
+		const response = await __originalFetch(input, init);
+		const duration = Date.now() - fetchStart;
+
+		// Clone response so we can read the body for logging without consuming it
+		const cloned = response.clone();
+		let responsePreview = "";
+		try {
+			const text = await cloned.text();
+			responsePreview = text.length > 500 ? text.substring(0, 500) + "..." : text;
+		} catch {}
+
+		__logs.push({
+			type: "fetch",
+			message: method + " " + url + " → " + response.status + " (" + duration + "ms)",
+			timestamp: Date.now(),
+			data: {
+				url,
+				method,
+				status: response.status,
+				duration_ms: duration,
+				response_preview: responsePreview
+			}
+		});
+
+		return response;
+	} catch (err) {
+		__logs.push({
+			type: "fetch",
+			message: method + " " + url + " → FAILED: " + (err.message || err),
+			timestamp: Date.now(),
+			data: { url, method, error: err.message || String(err) }
+		});
+		throw err;
+	}
+};
+
+// ─── Customer Code ───────────────────────────────────────────────────────────
 ${customerCode}
 
-// Dynamic Worker entrypoint
+// ─── Entrypoint ──────────────────────────────────────────────────────────────
 export default {
 	async route(ctx) {
 		if (typeof route !== "function") {
-			return { error: "No route() function defined" };
+			return { error: "No route() function defined", _logs: __logs };
 		}
 		try {
 			const result = await route(ctx);
-			return result;
+			return { ...result, _logs: __logs };
 		} catch (err) {
-			return { error: err.message || "Routing code error" };
+			__logs.push({
+				type: "error",
+				message: "Routing code error: " + (err.message || err),
+				timestamp: Date.now()
+			});
+			return { error: err.message || "Routing code error", _logs: __logs };
 		}
 	}
 };
