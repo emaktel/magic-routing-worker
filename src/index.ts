@@ -16,8 +16,6 @@ interface Env {
 			compatibilityDate: string;
 			mainModule: string;
 			modules: Record<string, string>;
-			env?: Record<string, unknown>;
-			globalOutbound?: Fetcher | null;
 		}): {
 			getEntrypoint(): {
 				route(ctx: CallContext): Promise<RoutingResult>;
@@ -28,6 +26,7 @@ interface Env {
 	POSTGREST_URL: string;
 	POSTGREST_API_KEY: string;
 	MAGIC_ROUTING_API_KEY: string;
+	ENCRYPTION_KEY: string;
 }
 
 interface CallContext {
@@ -85,6 +84,11 @@ interface MagicRoutingBlock {
 	enabled?: boolean;
 }
 
+interface SecretRow {
+	key_name: string;
+	encrypted_value: string;
+}
+
 export default {
 	async fetch(request: Request, env: Env): Promise<Response> {
 		const url = new URL(request.url);
@@ -107,8 +111,8 @@ export default {
 				return Response.json({ error: "Invalid block_id" }, { status: 400 });
 			}
 
-			const code = await fetchRoutingCode(env, block_id);
-			if (!code) {
+			const blockData = await fetchRoutingBlock(env, block_id);
+			if (!blockData) {
 				const logs: LogEntry[] = [{ type: "error", message: "Routing block not found or disabled", timestamp: Date.now() }];
 				if (test_user_uuid) {
 					await broadcastTestResult(env, { userUuid: test_user_uuid, domainUuid: call_context.domain_uuid }, {
@@ -120,14 +124,13 @@ export default {
 				return Response.json({ error: "Routing block not found" }, { status: 404 });
 			}
 
-			// Build the instrumented worker module with logging
-			const workerCode = buildWorkerModule(code);
+			// Build the instrumented worker module with logging + secrets
+			const workerCode = buildWorkerModule(blockData.code, blockData.secrets);
 
 			const worker = env.LOADER.load({
 				compatibilityDate: "2026-03-01",
 				mainModule: "magic.js",
 				modules: { "magic.js": workerCode },
-				globalOutbound: undefined,
 			});
 
 			const result = await worker.getEntrypoint().route(call_context);
@@ -238,21 +241,83 @@ async function broadcastTestResult(
 
 // ─── PostgREST ───────────────────────────────────────────────────────────────
 
-async function fetchRoutingCode(env: Env, blockId: string): Promise<string | null> {
-	const url = `${env.POSTGREST_URL}/magic_routing?id=eq.${encodeURIComponent(blockId)}&enabled=eq.true&select=code&limit=1`;
-	const resp = await fetch(url, {
-		headers: {
-			"Authorization": `Bearer ${env.POSTGREST_API_KEY}`,
-			"Accept": "application/json",
-		},
-	});
-	if (!resp.ok) {
-		console.error("[magic-routing] PostgREST error:", resp.status, await resp.text());
+interface RoutingBlockData {
+	code: string;
+	secrets: Record<string, string>;
+}
+
+async function fetchRoutingBlock(env: Env, blockId: string): Promise<RoutingBlockData | null> {
+	// Fetch code and secrets in parallel
+	const [codeResp, secretsResp] = await Promise.all([
+		fetch(`${env.POSTGREST_URL}/magic_routing?id=eq.${encodeURIComponent(blockId)}&enabled=eq.true&select=code&limit=1`, {
+			headers: { "Authorization": `Bearer ${env.POSTGREST_API_KEY}`, "Accept": "application/json" },
+		}),
+		fetch(`${env.POSTGREST_URL}/magic_routing_secrets?block_id=eq.${encodeURIComponent(blockId)}&select=key_name,encrypted_value`, {
+			headers: { "Authorization": `Bearer ${env.POSTGREST_API_KEY}`, "Accept": "application/json" },
+		}),
+	]);
+
+	if (!codeResp.ok) {
+		console.error("[magic-routing] PostgREST error:", codeResp.status, await codeResp.text());
 		return null;
 	}
-	const rows = (await resp.json()) as MagicRoutingBlock[];
+	const rows = (await codeResp.json()) as MagicRoutingBlock[];
 	if (!rows || rows.length === 0) return null;
-	return rows[0].code;
+
+	// Decrypt secrets
+	const secrets: Record<string, string> = {};
+	if (secretsResp.ok && env.ENCRYPTION_KEY) {
+		const secretRows = (await secretsResp.json()) as SecretRow[];
+		for (const row of secretRows) {
+			try {
+				secrets[row.key_name] = await decrypt(row.encrypted_value, env.ENCRYPTION_KEY);
+			} catch (err) {
+				console.error(`[magic-routing] Failed to decrypt secret ${row.key_name}:`, err);
+			}
+		}
+	}
+
+	return { code: rows[0].code, secrets };
+}
+
+// ─── AES-256-GCM Decryption (Web Crypto API) ───────────────────────────────
+
+const IV_LENGTH = 12;
+const AUTH_TAG_LENGTH = 16;
+
+async function decrypt(encryptedBase64: string, hexKey: string): Promise<string> {
+	const keyBytes = hexToBytes(hexKey);
+	const combined = base64ToBytes(encryptedBase64);
+
+	const iv = combined.slice(0, IV_LENGTH);
+	const ciphertext = combined.slice(IV_LENGTH, combined.length - AUTH_TAG_LENGTH);
+	const authTag = combined.slice(combined.length - AUTH_TAG_LENGTH);
+
+	// Web Crypto expects ciphertext + authTag concatenated
+	const ciphertextWithTag = new Uint8Array(ciphertext.length + authTag.length);
+	ciphertextWithTag.set(ciphertext, 0);
+	ciphertextWithTag.set(authTag, ciphertext.length);
+
+	const cryptoKey = await crypto.subtle.importKey("raw", keyBytes, { name: "AES-GCM" }, false, ["decrypt"]);
+	const decrypted = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, cryptoKey, ciphertextWithTag);
+	return new TextDecoder().decode(decrypted);
+}
+
+function hexToBytes(hex: string): Uint8Array {
+	const bytes = new Uint8Array(hex.length / 2);
+	for (let i = 0; i < hex.length; i += 2) {
+		bytes[i / 2] = parseInt(hex.substring(i, i + 2), 16);
+	}
+	return bytes;
+}
+
+function base64ToBytes(base64: string): Uint8Array {
+	const binary = atob(base64);
+	const bytes = new Uint8Array(binary.length);
+	for (let i = 0; i < binary.length; i++) {
+		bytes[i] = binary.charCodeAt(i);
+	}
+	return bytes;
 }
 
 // ─── Dynamic Worker Module Builder ───────────────────────────────────────────
@@ -261,9 +326,10 @@ async function fetchRoutingCode(env: Env, blockId: string): Promise<string | nul
  * Wraps the customer's code with:
  * - A log() function that collects debug messages
  * - A wrapped fetch() that auto-logs API calls and responses
+ * - Decrypted secrets as `env` object (e.g., env.OPENWEATHERMAP_KEY)
  * - Collects all logs and returns them alongside the routing decision
  */
-function buildWorkerModule(customerCode: string): string {
+function buildWorkerModule(customerCode: string, secrets: Record<string, string> = {}): string {
 	return `
 // ─── Instrumentation Layer ───────────────────────────────────────────────────
 const __logs = [];
@@ -389,6 +455,10 @@ function isWeekday(tz) {
 
 // Check if today is a weekend (Saturday-Sunday)
 function isWeekend(tz) { return !isWeekday(tz); }
+
+// ─── Secrets ────────────────────────────────────────────────────────────────
+// Decrypted secrets injected at load time (e.g., env.OPENWEATHERMAP_KEY)
+const env = ${JSON.stringify(secrets)};
 
 // ─── Customer Code ───────────────────────────────────────────────────────────
 ${customerCode}
