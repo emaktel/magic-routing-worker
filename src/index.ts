@@ -255,9 +255,18 @@ const __logs = [];
 const __startTime = Date.now();
 
 function log(message, data) {
+	// If data is provided, append it to the message string for visibility
+	let fullMessage = String(message);
+	if (data !== undefined) {
+		try {
+			const dataStr = typeof data === "object" ? JSON.stringify(data) : String(data);
+			// If message ends with ":" or ": ", append data inline
+			fullMessage = fullMessage.replace(/:\s*$/, "") + ": " + (dataStr.length > 200 ? dataStr.substring(0, 200) + "..." : dataStr);
+		} catch {}
+	}
 	__logs.push({
 		type: "log",
-		message: String(message),
+		message: fullMessage,
 		timestamp: Date.now(),
 		data: data !== undefined ? data : undefined
 	});
@@ -309,6 +318,63 @@ globalThis.fetch = async function(input, init) {
 	}
 };
 
+// ─── Time & Date Helpers (timezone-aware) ────────────────────────────────────
+// These use the tenant's timezone from FreeSWITCH (ctx.timezone)
+// or fall back to UTC. Available to all customer code.
+let __timezone = "UTC";
+
+function __initTimezone(ctx) {
+	if (ctx && ctx.timezone) __timezone = ctx.timezone;
+}
+
+// Get current local Date object parts in the tenant's timezone
+function __localParts(tz) {
+	const t = tz || __timezone;
+	const now = new Date();
+	const str = now.toLocaleString("en-US", { timeZone: t, hour12: false });
+	// Parse "M/D/YYYY, HH:MM:SS"
+	const [datePart, timePart] = str.split(", ");
+	const [month, day, year] = datePart.split("/").map(Number);
+	const [hour, minute, second] = timePart.split(":").map(Number);
+	const dayOfWeek = new Intl.DateTimeFormat("en-US", { weekday: "long", timeZone: t }).format(now).toLowerCase();
+	return { year, month, day, hour, minute, second, dayOfWeek };
+}
+
+// Get the current local hour (0-23) in the tenant's timezone
+function getLocalHour(tz) { return __localParts(tz).hour; }
+
+// Get the current local minute (0-59) in the tenant's timezone
+function getLocalMinute(tz) { return __localParts(tz).minute; }
+
+// Get the current local time as "HH:MM" in the tenant's timezone
+function getLocalTime(tz) {
+	const p = __localParts(tz);
+	return String(p.hour).padStart(2, "0") + ":" + String(p.minute).padStart(2, "0");
+}
+
+// Get the current local day of week (lowercase: "monday", "tuesday", etc.)
+function getLocalDay(tz) { return __localParts(tz).dayOfWeek; }
+
+// Check if current local time is between start and end (HH:MM format, handles overnight)
+function isTimeBetween(start, end, tz) {
+	const p = __localParts(tz);
+	const now = p.hour * 60 + p.minute;
+	const [sh, sm] = start.split(":").map(Number);
+	const [eh, em] = end.split(":").map(Number);
+	const s = sh * 60 + sm;
+	const e = eh * 60 + em;
+	return s <= e ? (now >= s && now < e) : (now >= s || now < e);
+}
+
+// Check if today is a weekday (Monday-Friday)
+function isWeekday(tz) {
+	const day = getLocalDay(tz);
+	return ["monday", "tuesday", "wednesday", "thursday", "friday"].includes(day);
+}
+
+// Check if today is a weekend (Saturday-Sunday)
+function isWeekend(tz) { return !isWeekday(tz); }
+
 // ─── Customer Code ───────────────────────────────────────────────────────────
 ${customerCode}
 
@@ -319,6 +385,7 @@ export default {
 			return { error: "No route() function defined", _logs: __logs };
 		}
 		try {
+			__initTimezone(ctx);
 			const result = await route(ctx);
 			return { ...result, _logs: __logs };
 		} catch (err) {
