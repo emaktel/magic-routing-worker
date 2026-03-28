@@ -103,14 +103,14 @@ export default {
 			const body = (await request.json()) as RouteRequest;
 			const { block_id, call_context, test_user_uuid, test_block_name } = body;
 
-			if (!block_id) {
-				return Response.json({ error: "Missing block_id" }, { status: 400 });
+			if (!block_id || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(block_id)) {
+				return Response.json({ error: "Invalid block_id" }, { status: 400 });
 			}
 
 			const code = await fetchRoutingCode(env, block_id);
 			if (!code) {
 				const logs: LogEntry[] = [{ type: "error", message: "Routing block not found or disabled", timestamp: Date.now() }];
-				if (test_user_uuid || call_context.domain_uuid) {
+				if (test_user_uuid) {
 					await broadcastTestResult(env, { userUuid: test_user_uuid, domainUuid: call_context.domain_uuid }, {
 						block_id, block_name: test_block_name, success: false,
 						error: "Routing block not found or disabled",
@@ -132,12 +132,10 @@ export default {
 
 			const result = await worker.getEntrypoint().route(call_context);
 
-			// Extract logs from the result
-			const logs: LogEntry[] = result._logs || [];
-
 			if (!result || !result.app) {
+				const logs: LogEntry[] = result?._logs || [];
 				logs.push({ type: "error", message: result?.error || "Invalid routing decision returned", timestamp: Date.now() });
-				if (test_user_uuid || call_context.domain_uuid) {
+				if (test_user_uuid) {
 					await broadcastTestResult(env, { userUuid: test_user_uuid, domainUuid: call_context.domain_uuid }, {
 						block_id, block_name: test_block_name, success: false,
 						error: result?.error || "Invalid routing decision",
@@ -147,11 +145,14 @@ export default {
 				return Response.json({ error: "Invalid routing decision returned" }, { status: 500 });
 			}
 
+			// Extract logs from the result
+			const logs: LogEntry[] = result._logs || [];
+
 			// Handle explicit fallback — code matched no rules or encountered an issue
 			if (result.app === "fallback") {
 				const reason = result.data || "No matching rules";
 				logs.push({ type: "log", message: `Fallback: ${reason}`, timestamp: Date.now() });
-				if (test_user_uuid || call_context.domain_uuid) {
+				if (test_user_uuid) {
 					await broadcastTestResult(env, { userUuid: test_user_uuid, domainUuid: call_context.domain_uuid }, {
 						block_id, block_name: test_block_name, success: true,
 						decision: { app: "fallback", data: reason },
@@ -165,7 +166,7 @@ export default {
 			const allowed = ["transfer", "bridge", "playback", "set", "hangup"];
 			if (!allowed.includes(result.app)) {
 				logs.push({ type: "error", message: `Disallowed app: ${result.app}`, timestamp: Date.now() });
-				if (test_user_uuid || call_context.domain_uuid) {
+				if (test_user_uuid) {
 					await broadcastTestResult(env, { userUuid: test_user_uuid, domainUuid: call_context.domain_uuid }, {
 						block_id, block_name: test_block_name, success: false,
 						error: `Disallowed app: ${result.app}`,
@@ -185,7 +186,7 @@ export default {
 			logs.push({ type: "decision", message: `Routing decision: ${decision.app} → ${decision.data}`, timestamp: Date.now(), data: decision });
 
 			// Broadcast result via WebSocket
-			if (test_user_uuid || call_context.domain_uuid) {
+			if (test_user_uuid) {
 				await broadcastTestResult(env, { userUuid: test_user_uuid, domainUuid: call_context.domain_uuid }, {
 					block_id,
 					block_name: test_block_name,
@@ -200,9 +201,8 @@ export default {
 
 			return Response.json(decision);
 		} catch (err: unknown) {
-			const message = err instanceof Error ? err.message : "Unknown error";
-			console.error("[magic-routing] Error:", message);
-			return Response.json({ error: message }, { status: 500 });
+			console.error("[magic-routing] Error:", err instanceof Error ? err.message : err);
+			return Response.json({ error: "Internal server error" }, { status: 500 });
 		}
 	},
 };
