@@ -10,9 +10,17 @@
 		}
 	],
 
+	// Service Binding to the WebSocket worker for real-time test result broadcasting
+	"services": [
+		{
+			"binding": "WEBSOCKET_WORKER",
+			"service": "fusion-websocket-worker"
+		}
+	],
+
 	// Environment variables (non-secret)
 	"vars": {
-		"POSTGREST_URL": "https://prod-ro-db.emaktalk.com/api"
+		"POSTGREST_URL": "https://dev-ro-db.emaktalk.com/api"
 	}
 
 	// Secrets (set via `npx wrangler secret put`):

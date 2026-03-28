@@ -4,6 +4,10 @@
  * Receives call context from the FreeSWITCH Lua script, fetches the
  * customer's routing code from PostgREST, loads it as a Dynamic Worker,
  * and returns the routing decision.
+ *
+ * When test_user_uuid is provided in the request, broadcasts the routing
+ * result in real-time to the user's WebSocket session via the fusion
+ * WebSocket worker service binding.
  */
 
 interface Env {
@@ -20,6 +24,7 @@ interface Env {
 			};
 		};
 	};
+	WEBSOCKET_WORKER: Fetcher;
 	POSTGREST_URL: string;
 	POSTGREST_API_KEY: string;
 	MAGIC_ROUTING_API_KEY: string;
@@ -60,6 +65,10 @@ interface RoutingDecision {
 interface RouteRequest {
 	block_id: string;
 	call_context: CallContext;
+	/** When set, broadcasts the routing result to this user via WebSocket. If not set, broadcasts to domain_uuid from call_context. */
+	test_user_uuid?: string;
+	/** When set, includes the block name in the test broadcast */
+	test_block_name?: string;
 }
 
 interface MagicRoutingBlock {
@@ -85,7 +94,7 @@ export default {
 
 		try {
 			const body = (await request.json()) as RouteRequest;
-			const { block_id, call_context } = body;
+			const { block_id, call_context, test_user_uuid, test_block_name } = body;
 
 			if (!block_id) {
 				return Response.json({ error: "Missing block_id" }, { status: 400 });
@@ -94,6 +103,17 @@ export default {
 			// fetch the customer's code from PostgREST
 			const code = await fetchRoutingCode(env, block_id);
 			if (!code) {
+				// Broadcast error to test user if in test mode
+				if (test_user_uuid) {
+					await broadcastTestResult(env, { userUuid: test_user_uuid, domainUuid: call_context.domain_uuid }, {
+						block_id,
+						block_name: test_block_name,
+						success: false,
+						error: "Routing block not found or disabled",
+						call_context,
+						timestamp: Date.now(),
+					});
+				}
 				return Response.json({ error: "Routing block not found" }, { status: 404 });
 			}
 
@@ -113,22 +133,56 @@ export default {
 
 			// validate the response
 			if (!result || !result.app) {
+				if (test_user_uuid) {
+					await broadcastTestResult(env, { userUuid: test_user_uuid, domainUuid: call_context.domain_uuid }, {
+						block_id,
+						block_name: test_block_name,
+						success: false,
+						error: result?.error || "Invalid routing decision returned",
+						call_context,
+						timestamp: Date.now(),
+					});
+				}
 				return Response.json({ error: "Invalid routing decision returned" }, { status: 500 });
 			}
 
 			const allowed = ["transfer", "bridge", "playback", "set", "hangup"];
 			if (!allowed.includes(result.app)) {
+				if (test_user_uuid) {
+					await broadcastTestResult(env, { userUuid: test_user_uuid, domainUuid: call_context.domain_uuid }, {
+						block_id,
+						block_name: test_block_name,
+						success: false,
+						error: `Disallowed app: ${result.app}`,
+						call_context,
+						timestamp: Date.now(),
+					});
+				}
 				return Response.json(
 					{ error: `Disallowed app: ${result.app}` },
 					{ status: 400 }
 				);
 			}
 
-			return Response.json({
+			const decision = {
 				app: result.app,
 				data: result.data || "",
 				continue_routing: result.continue_routing || false,
-			});
+			};
+
+			// Broadcast result to test user via WebSocket
+			if (test_user_uuid) {
+				await broadcastTestResult(env, { userUuid: test_user_uuid, domainUuid: call_context.domain_uuid }, {
+					block_id,
+					block_name: test_block_name,
+					success: true,
+					decision,
+					call_context,
+					timestamp: Date.now(),
+				});
+			}
+
+			return Response.json(decision);
 		} catch (err: unknown) {
 			const message = err instanceof Error ? err.message : "Unknown error";
 			console.error("[magic-routing] Error:", message);
@@ -136,6 +190,41 @@ export default {
 		}
 	},
 };
+
+/**
+ * Broadcast a test result via the WebSocket worker.
+ * If userUuid is provided, sends to that specific user.
+ * Otherwise, broadcasts to all users in the domain (via domainUuid).
+ */
+async function broadcastTestResult(
+	env: Env,
+	targeting: { userUuid?: string; domainUuid?: string },
+	data: Record<string, unknown>
+): Promise<void> {
+	try {
+		const body: Record<string, unknown> = {
+			type: "magic_routing_test_result",
+			data,
+		};
+
+		if (targeting.userUuid) {
+			body.userUuid = targeting.userUuid;
+		} else if (targeting.domainUuid) {
+			body.domainUuid = targeting.domainUuid;
+		} else {
+			return; // No targeting — skip broadcast
+		}
+
+		await env.WEBSOCKET_WORKER.fetch("https://internal/broadcast", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(body),
+		});
+	} catch (err) {
+		// Non-critical — don't fail the routing decision because of a WS broadcast error
+		console.error("[magic-routing] Failed to broadcast test result:", err);
+	}
+}
 
 /**
  * Fetch the customer's routing code from PostgREST.
