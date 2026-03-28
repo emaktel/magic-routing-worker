@@ -147,6 +147,21 @@ export default {
 				return Response.json({ error: "Invalid routing decision returned" }, { status: 500 });
 			}
 
+			// Handle explicit fallback — code matched no rules or encountered an issue
+			if (result.app === "fallback") {
+				const reason = result.data || "No matching rules";
+				logs.push({ type: "log", message: `Fallback: ${reason}`, timestamp: Date.now() });
+				if (test_user_uuid || call_context.domain_uuid) {
+					await broadcastTestResult(env, { userUuid: test_user_uuid, domainUuid: call_context.domain_uuid }, {
+						block_id, block_name: test_block_name, success: true,
+						decision: { app: "fallback", data: reason },
+						logs, call_context, duration_ms: Date.now() - startTime, timestamp: Date.now(),
+					});
+				}
+				// Return error so Lua script uses its configured fallback destination
+				return Response.json({ error: `fallback: ${reason}` }, { status: 200 });
+			}
+
 			const allowed = ["transfer", "bridge", "playback", "set", "hangup"];
 			if (!allowed.includes(result.app)) {
 				logs.push({ type: "error", message: `Disallowed app: ${result.app}`, timestamp: Date.now() });
