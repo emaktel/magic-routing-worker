@@ -82,6 +82,7 @@ interface MagicRoutingBlock {
 	code: string;
 	domain_uuid?: string;
 	enabled?: boolean;
+	test_listeners?: { user_uuid: string; expires_at: number }[];
 }
 
 interface SecretRow {
@@ -102,25 +103,21 @@ export default {
 		}
 
 		const startTime = Date.now();
+		let blockData: RoutingBlockData | null = null;
+		let block_id = "";
+		let call_context: CallContext = {};
 
 		try {
 			const body = (await request.json()) as RouteRequest;
-			const { block_id, call_context, test_user_uuid, test_block_name } = body;
+			({ block_id, call_context } = body);
 
 			if (!block_id || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(block_id)) {
 				return Response.json({ error: "Invalid block_id" }, { status: 400 });
 			}
 
-			const blockData = await fetchRoutingBlock(env, block_id);
+			blockData = await fetchRoutingBlock(env, block_id);
 			if (!blockData) {
-				const logs: LogEntry[] = [{ type: "error", message: "Routing block not found or disabled", timestamp: Date.now() }];
-				if (test_user_uuid) {
-					await broadcastTestResult(env, { userUuid: test_user_uuid, domainUuid: call_context.domain_uuid }, {
-						block_id, block_name: test_block_name, success: false,
-						error: "Routing block not found or disabled",
-						logs, call_context, duration_ms: Date.now() - startTime, timestamp: Date.now(),
-					});
-				}
+				// No block = no listeners to notify; nothing to broadcast
 				return Response.json({ error: "Routing block not found" }, { status: 404 });
 			}
 
@@ -138,30 +135,27 @@ export default {
 			if (!result || !result.app) {
 				const logs: LogEntry[] = result?._logs || [];
 				logs.push({ type: "error", message: result?.error || "Invalid routing decision returned", timestamp: Date.now() });
-				if (test_user_uuid) {
-					await broadcastTestResult(env, { userUuid: test_user_uuid, domainUuid: call_context.domain_uuid }, {
-						block_id, block_name: test_block_name, success: false,
-						error: result?.error || "Invalid routing decision",
-						logs, call_context, duration_ms: Date.now() - startTime, timestamp: Date.now(),
-					});
-				}
+				await broadcastTestResult(env, blockData.listeners, {
+					block_id, success: false,
+					error: result?.error || "Invalid routing decision",
+					logs, call_context, duration_ms: Date.now() - startTime, timestamp: Date.now(),
+				});
 				return Response.json({ error: "Invalid routing decision returned" }, { status: 500 });
 			}
 
 			// Extract logs from the result
 			const logs: LogEntry[] = result._logs || [];
 
-			// Handle explicit fallback — code matched no rules or encountered an issue
+			// Handle explicit fallback — no rule matched; treat as a routing failure
 			if (result.app === "fallback") {
 				const reason = result.data || "No matching rules";
-				logs.push({ type: "log", message: `Fallback: ${reason}`, timestamp: Date.now() });
-				if (test_user_uuid) {
-					await broadcastTestResult(env, { userUuid: test_user_uuid, domainUuid: call_context.domain_uuid }, {
-						block_id, block_name: test_block_name, success: true,
-						decision: { app: "fallback", data: reason },
-						logs, call_context, duration_ms: Date.now() - startTime, timestamp: Date.now(),
-					});
-				}
+				logs.push({ type: "error", message: `Fallback: ${reason}`, timestamp: Date.now() });
+				await broadcastTestResult(env, blockData.listeners, {
+					block_id, success: false,
+					error: `Fallback — ${reason}`,
+					decision: { app: "fallback", data: reason },
+					logs, call_context, duration_ms: Date.now() - startTime, timestamp: Date.now(),
+				});
 				// Return error so Lua script uses its configured fallback destination
 				return Response.json({ error: `fallback: ${reason}` }, { status: 200 });
 			}
@@ -169,13 +163,11 @@ export default {
 			const allowed = ["transfer", "bridge", "playback", "set", "hangup"];
 			if (!allowed.includes(result.app)) {
 				logs.push({ type: "error", message: `Disallowed app: ${result.app}`, timestamp: Date.now() });
-				if (test_user_uuid) {
-					await broadcastTestResult(env, { userUuid: test_user_uuid, domainUuid: call_context.domain_uuid }, {
-						block_id, block_name: test_block_name, success: false,
-						error: `Disallowed app: ${result.app}`,
-						logs, call_context, duration_ms: Date.now() - startTime, timestamp: Date.now(),
-					});
-				}
+				await broadcastTestResult(env, blockData.listeners, {
+					block_id, success: false,
+					error: `Disallowed app: ${result.app}`,
+					logs, call_context, duration_ms: Date.now() - startTime, timestamp: Date.now(),
+				});
 				return Response.json({ error: `Disallowed app: ${result.app}` }, { status: 400 });
 			}
 
@@ -188,23 +180,29 @@ export default {
 			// Add the final decision as a log entry
 			logs.push({ type: "decision", message: `Routing decision: ${decision.app} → ${decision.data}`, timestamp: Date.now(), data: decision });
 
-			// Broadcast result via WebSocket
-			if (test_user_uuid) {
-				await broadcastTestResult(env, { userUuid: test_user_uuid, domainUuid: call_context.domain_uuid }, {
-					block_id,
-					block_name: test_block_name,
-					success: true,
-					decision,
-					logs,
-					call_context,
-					duration_ms: Date.now() - startTime,
-					timestamp: Date.now(),
-				});
-			}
+			// Broadcast result via WebSocket to all active test listeners
+			await broadcastTestResult(env, blockData.listeners, {
+				block_id,
+				success: true,
+				decision,
+				logs,
+				call_context,
+				duration_ms: Date.now() - startTime,
+				timestamp: Date.now(),
+			});
 
 			return Response.json(decision);
 		} catch (err: unknown) {
-			console.error("[magic-routing] Error:", err instanceof Error ? err.message : err);
+			const message = err instanceof Error ? err.message : String(err);
+			console.error("[magic-routing] Internal error:", message);
+			// Broadcast to any registered test listeners so the agent can see the crash
+			if (blockData) {
+				await broadcastTestResult(env, blockData.listeners, {
+					block_id, success: false,
+					error: `Internal error: ${message}`,
+					call_context, duration_ms: Date.now() - startTime, timestamp: Date.now(),
+				}).catch(() => {}); // best-effort
+			}
 			return Response.json({ error: "Internal server error" }, { status: 500 });
 		}
 	},
@@ -212,28 +210,26 @@ export default {
 
 // ─── WebSocket Broadcast ─────────────────────────────────────────────────────
 
+/**
+ * Broadcast a test result to all active listeners for the block.
+ * If no listeners are registered, silently skips — no domain-wide spray.
+ */
 async function broadcastTestResult(
 	env: Env,
-	targeting: { userUuid?: string; domainUuid?: string },
+	listeners: string[],
 	data: Record<string, unknown>
 ): Promise<void> {
+	if (listeners.length === 0) return;
 	try {
-		const body: Record<string, unknown> = {
-			type: "magic_routing_test_result",
-			data,
-		};
-		if (targeting.userUuid) {
-			body.userUuid = targeting.userUuid;
-		} else if (targeting.domainUuid) {
-			body.domainUuid = targeting.domainUuid;
-		} else {
-			return;
-		}
-		await env.WEBSOCKET_WORKER.fetch("https://internal/broadcast", {
-			method: "POST",
-			headers: { "Content-Type": "application/json" },
-			body: JSON.stringify(body),
-		});
+		await Promise.all(
+			listeners.map((userUuid) =>
+				env.WEBSOCKET_WORKER.fetch("https://internal/broadcast", {
+					method: "POST",
+					headers: { "Content-Type": "application/json" },
+					body: JSON.stringify({ type: "magic_routing_test_result", userUuid, data }),
+				})
+			)
+		);
 	} catch (err) {
 		console.error("[magic-routing] Failed to broadcast test result:", err);
 	}
@@ -244,12 +240,14 @@ async function broadcastTestResult(
 interface RoutingBlockData {
 	code: string;
 	secrets: Record<string, string>;
+	/** Active test listeners (already filtered for expiry) */
+	listeners: string[];
 }
 
 async function fetchRoutingBlock(env: Env, blockId: string): Promise<RoutingBlockData | null> {
 	// Fetch code and secrets in parallel
 	const [codeResp, secretsResp] = await Promise.all([
-		fetch(`${env.POSTGREST_URL}/magic_routing?id=eq.${encodeURIComponent(blockId)}&enabled=eq.true&select=code&limit=1`, {
+		fetch(`${env.POSTGREST_URL}/magic_routing?id=eq.${encodeURIComponent(blockId)}&enabled=eq.true&select=code,test_listeners&limit=1`, {
 			headers: { "Authorization": `Bearer ${env.POSTGREST_API_KEY}`, "Accept": "application/json" },
 		}),
 		fetch(`${env.POSTGREST_URL}/magic_routing_secrets?block_id=eq.${encodeURIComponent(blockId)}&select=key_name,encrypted_value`, {
@@ -277,7 +275,12 @@ async function fetchRoutingBlock(env: Env, blockId: string): Promise<RoutingBloc
 		}
 	}
 
-	return { code: rows[0].code, secrets };
+	const now = Date.now();
+	const listeners = (rows[0].test_listeners ?? [])
+		.filter((l) => l.expires_at > now)
+		.map((l) => l.user_uuid);
+
+	return { code: rows[0].code, secrets, listeners };
 }
 
 // ─── AES-256-GCM Decryption (Web Crypto API) ───────────────────────────────
